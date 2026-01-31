@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2020-2025 Bernhard Schelling
+ *  Copyright (C) 2020-2026 Bernhard Schelling
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -912,95 +912,14 @@ static bool AudioMix(short* buffer, unsigned int samples, bool need_mix)
 	unsigned char tm = (LastAudioThrottleMode == RETRO_THROTTLE_FAST_FORWARD ? RETRO_THROTTLE_FAST_FORWARD : ThrottleMode);
 	LastAudioThrottleMode = ThrottleMode;
 
-	extern Bit32u DBP_MIXER_DoneSamplesCount();
-	size_t have = DBP_MIXER_DoneSamplesCount(), want = samples;
-	if (tm == RETRO_THROTTLE_FAST_FORWARD) want = (FastRate ? (size_t)(samples * FastRate) : (size_t)DBP_MIXER_DoneSamplesCount());
-	if (tm == RETRO_THROTTLE_SLOW_MOTION) want = (size_t)(samples * SlowRate);
-	for (unsigned int tick = 0; have < want;)
-	{
-		ZL_Thread::Sleep(0);
-		have = DBP_MIXER_DoneSamplesCount();
-		if (have >= want) break;
-		if (!tick) tick = SDL_GetTicks();
-		if (((int)SDL_GetTicks() - (int)tick) >= (AudioLatency)) { /*ZL_LOG("AUDIOMIX", "Not enough audio");*/ break; } // emulation lagging (or crashed)
-	}
+	float speed = (
+		(tm == RETRO_THROTTLE_FAST_FORWARD   ? (FastRate ? FastRate : 9999999.0f) :
+		(tm == RETRO_THROTTLE_SLOW_MOTION    ? SlowRate :
+		(tm == RETRO_THROTTLE_FRAME_STEPPING ? 0.0f : 1.0f))));
 
-	if (have == 0)
-	{
-		//ZL_LOG("AUDIOMIX", "Have zero audio");
-		memset(buffer, 0, samples * 4);
-		return true;
-	}
-
-	const bool catchup = (have > want * (av.timing.fps < 50 ? 20 : 6)/4 && want == samples);
-	static unsigned int catchups;
-	if (catchup || catchups)
-	{
-		// When running with vsync we need to allow catching up for potentially much longer (until the emulation skips a frame)
-		unsigned int skip_catchups = 30; float corefps = (float)av.timing.fps, vsyncfps = ZL_Application::GetVsyncFps();
-		if (vsyncfps && vsyncfps > corefps) skip_catchups += (unsigned int)(1000.0f / ((vsyncfps - corefps) * AudioLatency));
-		catchups += (catchup ? 2 : -1);
-		//if (catchups > skip_catchups) want = samples * (((have - want) <= 800 ? 40800 : (40000 + have - want))) / 40000; // alternative speed up playback
-		//if (catchups > skip_catchups*2) catchups = 20;
-		if (catchups > skip_catchups || have > want * 3) AudioSkip = true;
-		ZL_LOG("AUDIOMIX", "Catch-up - Have %d but want %d (catchups: %u)", (int)have, (int)want, catchups);
-	}
-
-	void MIXER_CallBack(void *userdata, unsigned char *stream, int len);
-	if (have < want || want != samples || AudioSkip || tm == RETRO_THROTTLE_FRAME_STEPPING)
-	{
-		enum { UI_MAX_SAMPLES = 4096*4 };
-		static short stretchbuf[UI_MAX_SAMPLES * 2]; // stereo
-
-		size_t use;
-		if (tm == RETRO_THROTTLE_FAST_FORWARD || tm == RETRO_THROTTLE_SLOW_MOTION) use = ZL_Math::Min(have, want);
-		else if (have >= want || AudioSkip || tm == RETRO_THROTTLE_FRAME_STEPPING)
-		{
-			// When lagging behind, don't speed audio up and just scrap it instead (one hiccup is better than prolonged audio speedup)
-			if (AudioSkip) { ZL_LOG("AUDIOMIX", "Audio Skip!"); }
-			AudioSkip = false;
-			catchups = 0;
-			use = ZL_Math::Min(have, (size_t)samples);
-		}
-		else use = ((have < 10) ? have : (have * 7 / 10)); // use 70% for stretching while ahead, keep 20% as additional buffer to not fall behind again
-
-		if (use > UI_MAX_SAMPLES) use = UI_MAX_SAMPLES;
-		const double audio_stretch = (tm == RETRO_THROTTLE_FRAME_STEPPING ? 1.0 : (double)use / samples); // don't stretch during frame stepping
-		ZL_LOG("AUDIOMIX", "Stretch %d (of %d available total) into %d (factor %f)", (int)use, (int)have, (int)samples, (float)audio_stretch);
-		for (size_t scrap, keep = want / 5; have >= samples && have > use + keep; have -= scrap)
-		{
-			scrap = ZL_Math::Min((size_t)(have - use - keep), (size_t)UI_MAX_SAMPLES);
-			MIXER_CallBack(NULL, (unsigned char*)stretchbuf, (int)(scrap* 4));
-			ZL_LOG("AUDIOMIX", "Scrapping %d (of %d available total)", (int)scrap, (int)have);
-		}
-		MIXER_CallBack(NULL, (unsigned char*)stretchbuf, (int)(use* 4));
-
-		if (0)
-		{
-			for (size_t i = 0; i != samples*2; i++, buffer++) // repeat samples
-			{
-				buffer[0] = stretchbuf[i < (use*2) ? i : (use*2) - (i % (use*2))];
-			}
-		}
-		else
-		{
-			for (size_t i = 0, jMax = use - 1; i != samples; i++, buffer += 2) // linear interpolation
-			{
-				const double src_pos_float = i * audio_stretch;
-				const size_t j0 = (size_t)src_pos_float, j1 = j0 + (size_t)(j0 != jMax);
-				const double frac = src_pos_float - j0;
-				buffer[0] = (short)((1.0 - frac) * stretchbuf[j0 * 2 + 0] + frac * stretchbuf[j1 * 2 + 0]); // stretchbuf[j0 * 2 + 0] // simple nearest
-				buffer[1] = (short)((1.0 - frac) * stretchbuf[j0 * 2 + 1] + frac * stretchbuf[j1 * 2 + 1]); // stretchbuf[j0 * 2 + 1] // simple nearest
-			}
-		}
-
-		if (tm == RETRO_THROTTLE_FRAME_STEPPING && use < samples) { memset(buffer - (samples - use) * 2, 0, (samples - use) * 4); }
-		ui_last_audio_stretch = (float)audio_stretch;
-	}
-	else
-	{
-		MIXER_CallBack(NULL, (unsigned char*)buffer,  (int)(want * 4));
-	}
+	extern float DBPS_AudioMix(short* buffer, unsigned int samples, float speed, int max_wait);
+	float audio_stretch = DBPS_AudioMix(buffer, samples, speed, AudioLatency);
+	if (audio_stretch != 1.0f) ui_last_audio_stretch = audio_stretch;
 	return true;
 }
 
@@ -1535,8 +1454,6 @@ static void ApplyInterfaceOptions()
 	HotkeyMod = ((hkm & 1) ? ZLKMOD_CTRL : 0) | ((hkm & 2) ? ZLKMOD_ALT : 0) | ((hkm & 4) ? ZLKMOD_SHIFT : 0) | ((hkm & 8) ? ZLKMOD_META : 0) | ((hkm & 16) ? ZLKMOD_MODE : 0);
 
 	SpeedModHold = ((ZL_Application::SettingsGet("interface_speedtoggle").c_str()[0]|0x20) == 'h');
-	const float newFastRate = (ZL_Application::SettingsHas("interface_fastrate") ? ZL_Math::Max((float)atof(ZL_Application::SettingsGet("interface_fastrate").c_str()), 1.001f) : 5.0f);
-	const float newSlowRate = (ZL_Application::SettingsHas("interface_slowrate") ? ZL_Math::Min((float)atof(ZL_Application::SettingsGet("interface_slowrate").c_str()), 0.999f) : 0.3f);
 	const bool defaultPointerLock = ((ZL_Application::SettingsGet("interface_lockmouse").c_str()[0]|0x20) == 't');
 	DisableSystemALT = ((ZL_Application::SettingsGet("interface_systemhotkeys").c_str()[0]|0x20) == 'f');
 	UseMiddleMouseMenu = ((ZL_Application::SettingsGet("interface_middlemouse").c_str()[0]|0x20) == 't');
@@ -1567,6 +1484,9 @@ static void ApplyInterfaceOptions()
 	if (useCoreShader)
 		shdrCore.SetUniform(s(srfCore.GetWidth()), s(srfCore.GetHeight()), s(srfCore.GetWidth()*srfCore.GetScaleW()), s(srfCore.GetHeight()*srfCore.GetScaleH()), s(CRTFilter), s(ScanlineThinness), s(HorizontalBlur), s(MaskValue), s(Curvature), s(Corner));
 
+	float newFastRate = (ZL_Application::SettingsHas("interface_fastrate") ? ZL_Math::Max((float)atof(ZL_Application::SettingsGet("interface_fastrate").c_str()), 0.000f) : 5.0f);
+	float newSlowRate = (ZL_Application::SettingsHas("interface_slowrate") ? ZL_Math::Min((float)atof(ZL_Application::SettingsGet("interface_slowrate").c_str()), 0.999f) : 0.3f);
+	if (newFastRate <= 0) { newFastRate = 0; } else if (newFastRate < 1.001f) { newFastRate = 1.001f; }
 	if (newFastRate != FastRate || newSlowRate != SlowRate)
 	{
 		FastRate = newFastRate;
