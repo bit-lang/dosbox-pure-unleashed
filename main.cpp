@@ -49,13 +49,14 @@ enum EHotkeyFKeys
 };
 static unsigned short HotkeyMod;
 static unsigned char ThrottleMode, LastAudioThrottleMode;
-static bool ThrottlePaused, SpeedModHold, DisableSystemALT, UseMiddleMouseMenu, PointerLock, DrawStretched;
+static bool ThrottlePaused, SpeedModHold, DisableSystemALT, UseMiddleMouseMenu, PointerLock, DrawStretched, VariablesUpdated;
 static bool DrawCoreShader, DoApplyInterfaceOptions, DoApplyGeometry, DoSave, DoLoad, AudioSkip, DefaultPointerLock;
 static char Scaling;
 static int CRTFilter, AudioLatency;
 static float FastRate = 5.0f, SlowRate = 0.3f;
 static std::string PathSaves, PathSystem;
 static ZL_Vector PointerLockPos;
+static ZL_Json ConfigCache, ConfigOverrides;
 enum { FAST_FPS_LIMIT = 200 };
 
 static ZL_Surface srfCore, srfOSD;
@@ -484,6 +485,73 @@ static const char* JoyBindTemplatePS4Names[] = {
 
 static inline void DirtySettings() { dirtySettingsTick = ZLTICKS + 10000; }
 static inline void SynchronizeSettings(bool force) { if (dirtySettingsTick && (force || ZLPASSED(dirtySettingsTick))) { ZL_Application::SettingsSynchronize(); dirtySettingsTick = 0; } }
+static inline bool IsInterfaceConfigKey(const char* key) { return (key[0] == 'i' || !strcmp(key, "dosbox_pure_aspect_correction")); }
+
+static const char* GetSetting(const char* key, const char* defaultval = NULL)
+{
+	// Use cache so returned values have stable pointers
+	if (ZL_Json cv = ConfigCache.GetByKey(key))
+		return cv.GetString();
+	if (ZL_Json ov = ConfigOverrides.GetByKey(key))
+	{
+		if (ov.GetType() != ZL_Json::TYPE_STRING) return defaultval;
+		ZL_Json it = ConfigCache[key];
+		it.SetString(ov.GetString());
+		return it.GetString();
+	}
+	if (ZL_Application::SettingsHas(key))
+	{
+		ZL_String val = ZL_Application::SettingsGet(key);
+		if (val.empty()) return defaultval;
+		ZL_Json it = ConfigCache[key];
+		it.SetString(val.empty() ? NULL : val.c_str());
+		return it.GetString();
+	}
+	return defaultval;
+}
+
+bool DBPS_IsConfigOverride(const char* key)
+{
+	return ConfigOverrides.HasKey(key);
+}
+
+std::string DBPS_GetConfigOverrideJSON()
+{
+	return (ConfigOverrides.Size() ? ConfigOverrides.ToString() : ZL_String());
+}
+
+void DBPS_ToggleConfigOverride(const char* key, const char* defaultval)
+{
+	if (ConfigOverrides.HasKey(key))
+	{
+		mtxCoreOptions.Lock();
+		ConfigOverrides.Erase(key);
+		ConfigCache.Erase(key);
+		VariablesUpdated = true;
+		if (IsInterfaceConfigKey(key)) DoApplyInterfaceOptions = true;
+		mtxCoreOptions.Unlock();
+	}
+	else
+		ConfigOverrides[key].SetString(GetSetting(key, defaultval));
+}
+
+bool DBPS_ApplyConfigOverrides(const std::string& json)
+{
+	for (unsigned int oldcrc = 0, loop = 0;; loop++)
+	{
+		unsigned int crc = 0;
+		bool affect_interface = false;
+		for (const ZL_Json& it : ConfigOverrides)
+		{
+			const char *key = it.GetKey(), *val = it.GetString("");
+			crc ^= ZL_Checksum::CRC32(key, strlen(key), ZL_Checksum::CRC32(val, strlen(val), crc)); // XOR to ignore order
+			affect_interface = (loop != 0 && (affect_interface || IsInterfaceConfigKey(key)));
+		}
+		if (loop == 0) { oldcrc = crc; ConfigOverrides = ZL_Json(json); }
+		else if (oldcrc == crc) return false;
+		else { ConfigCache.Clear(); DoApplyInterfaceOptions |= affect_interface; return true; }
+	}
+}
 
 static EBindId GetBindIdFromRetro(unsigned device, unsigned index, unsigned id, bool axispos = false)
 {
@@ -724,7 +792,7 @@ static retro_proc_address_t RETRO_CALLCONV retro_hw_get_proc_address(const char 
 	return (retro_proc_address_t)SDL_GL_GetProcAddress(sym);
 }
 
-uintptr_t RETRO_CALLCONV retro_hw_get_current_framebuffer(void)
+static uintptr_t RETRO_CALLCONV retro_hw_get_current_framebuffer(void)
 {
 	extern unsigned ZL_Surface_GetGLFrameBuffer(ZL_Surface* srf);
 	return ZL_Surface_GetGLFrameBuffer(&srfCore);
@@ -733,7 +801,6 @@ uintptr_t RETRO_CALLCONV retro_hw_get_current_framebuffer(void)
 static bool RETRO_CALLCONV retro_environment_cb(unsigned cmd, void *data)
 {
 	ZL_ASSERT(MainThreadID == SDL_GetThreadID() || cmd == RETRO_ENVIRONMENT_GET_VFS_INTERFACE || cmd == RETRO_ENVIRONMENT_GET_VARIABLE || cmd == RETRO_ENVIRONMENT_SET_VARIABLE || cmd == RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY || cmd == RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY);
-	static bool variables_updated;
 	switch (cmd)
 	{
 		case RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME:
@@ -771,48 +838,48 @@ static bool RETRO_CALLCONV retro_environment_cb(unsigned cmd, void *data)
 			mtxCoreOptions.Lock();
 			for (const retro_core_option_v2_definition *it = ((retro_core_options_v2*)data)->definitions; it->key; it++)
 			{
-				if (!ZL_Application::SettingsHas(it->key)) continue;
-				ZL_String val = ZL_Application::SettingsGet(it->key);
-				if (val != it->default_value) { for (const retro_core_option_value *v = it->values; v->value; v++) { if (val == v->value) goto keyok; } }
+				const char* val = GetSetting(it->key);
+				if (!val) continue;
+				if (strcmp(val, it->default_value)) { for (const retro_core_option_value *v = it->values; v->value; v++) { if (!strcmp(val, v->value)) goto keyok; } }
 				static const char* allowlist[] = { "interface_fastrate", "interface_slowrate", "interface_audiolatency",
 					"dosbox_pure_force60fps", "dosbox_pure_menu_transparency", "dosbox_pure_mouse_speed_factor", "dosbox_pure_mouse_speed_factor_x", "dosbox_pure_joystick_analog_deadzone",
 					"dosbox_pure_cycles", "dosbox_pure_cycles_max", "dosbox_pure_cycles_scale", "dosbox_pure_cycle_limit" };
 				for (const char* p : allowlist) { if (!strcmp(it->key, p)) goto keyok; }
 				ZL_Application::SettingsDel(it->key);
+				ConfigCache.Erase(it->key);
 				keyok:;
 			}
 			mtxCoreOptions.Unlock();
 			return true;
 		case RETRO_ENVIRONMENT_GET_VARIABLE:
 		{
-			bool res = true;
 			mtxCoreOptions.Lock();
-			ZL_String val = ZL_Application::SettingsGet(((retro_variable*)data)->key);
-			if (!val.empty())
-			{
-				static ZL_Json storage; // to keep the string pointers stable
-				ZL_Json it = storage[((retro_variable*)data)->key];
-				it.SetString(val.c_str());
-				((retro_variable*)data)->value = it.GetString();
-			}
-			else res = false;
+			bool res = ((((retro_variable*)data)->value = GetSetting(((retro_variable*)data)->key)) != NULL);
 			mtxCoreOptions.Unlock();
 			return res;
 		}
 		case RETRO_ENVIRONMENT_SET_VARIABLE:
 		{
 			mtxCoreOptions.Lock();
-			if (!((retro_variable*)data)->value) ZL_Application::SettingsDel(((retro_variable*)data)->key);
-			else ZL_Application::SettingsSet(((retro_variable*)data)->key, ((retro_variable*)data)->value);
-			DirtySettings();
-			variables_updated = true;
-			if (((retro_variable*)data)->key[0] == 'i' || !strcmp(((retro_variable*)data)->key, "dosbox_pure_aspect_correction")) DoApplyInterfaceOptions = true;
+			if (ConfigOverrides.HasKey(((retro_variable*)data)->key))
+			{
+				ConfigOverrides[((retro_variable*)data)->key].SetString(((retro_variable*)data)->value);
+			}
+			else
+			{
+				if (!((retro_variable*)data)->value) ZL_Application::SettingsDel(((retro_variable*)data)->key);
+				else ZL_Application::SettingsSet(((retro_variable*)data)->key, ((retro_variable*)data)->value); 
+				DirtySettings();
+			}
+			ConfigCache.Erase(((retro_variable*)data)->key);
+			VariablesUpdated = true;
+			if (IsInterfaceConfigKey(((retro_variable*)data)->key)) DoApplyInterfaceOptions = true;
 			mtxCoreOptions.Unlock();
 			return true;
 		}
 		case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
-			*((bool*)data) = variables_updated;
-			variables_updated = false;
+			*((bool*)data) = VariablesUpdated;
+			VariablesUpdated = false;
 			return true;
 		case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
 			return false;
@@ -1449,44 +1516,44 @@ static void ApplyInterfaceOptions()
 	);
 
 	mtxCoreOptions.Lock();
-	ZL_String hkmstr = ZL_Application::SettingsGet("interface_hotkeymod");
-	int hkm = (hkmstr.empty() ? 1 : atoi(hkmstr.c_str()));
+	int hkm = atoi(GetSetting("interface_hotkeymod", "1"));
 	HotkeyMod = ((hkm & 1) ? ZLKMOD_CTRL : 0) | ((hkm & 2) ? ZLKMOD_ALT : 0) | ((hkm & 4) ? ZLKMOD_SHIFT : 0) | ((hkm & 8) ? ZLKMOD_META : 0) | ((hkm & 16) ? ZLKMOD_MODE : 0);
 
-	SpeedModHold = ((ZL_Application::SettingsGet("interface_speedtoggle").c_str()[0]|0x20) == 'h');
-	const bool defaultPointerLock = ((ZL_Application::SettingsGet("interface_lockmouse").c_str()[0]|0x20) == 't');
-	DisableSystemALT = ((ZL_Application::SettingsGet("interface_systemhotkeys").c_str()[0]|0x20) == 'f');
-	UseMiddleMouseMenu = ((ZL_Application::SettingsGet("interface_middlemouse").c_str()[0]|0x20) == 't');
-	DrawStretched = !strcmp(ZL_Application::SettingsGet("dosbox_pure_aspect_correction").c_str(), "fill");
-	Scaling = (ZL_Application::SettingsGet("interface_scaling").c_str()[0]&0x5f);
-	CRTFilter = atoi(ZL_Application::SettingsGet("interface_crtfilter").c_str());
-	const int audlatency = (ZL_Application::SettingsHas("interface_audiolatency" ) ? ZL_Math::Max(atoi(ZL_Application::SettingsGet("interface_audiolatency").c_str()), 5) : 25);
+	SpeedModHold = ((GetSetting("interface_speedtoggle", "toggle")[0]|0x20) == 'h');
+	const bool defaultPointerLock = ((GetSetting("interface_lockmouse", "false")[0]|0x20) == 't');
+	DisableSystemALT = ((GetSetting("interface_systemhotkeys", "true")[0]|0x20) == 'f');
+	UseMiddleMouseMenu = ((GetSetting("interface_middlemouse", "false")[0]|0x20) == 't');
+	DrawStretched = !strcmp(GetSetting("dosbox_pure_aspect_correction", "false"), "fill");
+	Scaling = (GetSetting("interface_scaling", "default")[0]&0x5f);
+	CRTFilter = atoi(GetSetting("interface_crtfilter", "false"));
+	const int audlatency = ZL_Math::Max(atoi(GetSetting("interface_audiolatency", "25")), 5);
 
 	static const char* sLastShaderSrc;
 	const bool useCoreShader = (CRTFilter || !Scaling || Scaling == 'D');
 	const char* shaderSrc = (CRTFilter ? fragment_shader_crt_src : (useCoreShader ? fragment_shader_scaling_src : NULL));
 	if (shaderSrc != sLastShaderSrc) { sLastShaderSrc = shaderSrc; shdrCore = (shaderSrc ? ZL_Shader(shaderSrc, NULL, "TextureSize_x", "TextureSize_y", (CRTFilter ? 8 : 0), "InputSize_x", "InputSize_y", "ShadowMask", "ScanlineThinness", "HorizontalBlur", "MaskValue", "Curvature", "Corner") : ZL_Shader()); }
 
-	int crtscanline  = (ZL_Application::SettingsHas("interface_crtscanline" ) ? atoi(ZL_Application::SettingsGet("interface_crtscanline" ).c_str()) : 1); //{ "0", "No scanline gaps" },{ "4", "Weak gaps" },{ "8", "Strong gaps" },
-	int crtblur      = (ZL_Application::SettingsHas("interface_crtblur"     ) ? atoi(ZL_Application::SettingsGet("interface_crtblur"     ).c_str()) : 2); //{ "0", "Blurry" },{ "1", "Smooth" },{ "2", "Default" },{ "3", "Pixely" },{ "4", "Sharper" },
-	int crtmask      = (ZL_Application::SettingsHas("interface_crtmask"     ) ? atoi(ZL_Application::SettingsGet("interface_crtmask"     ).c_str()) : 2); //{ "0", "Disabled" },{ "1", "Weak" },{ "2", "Default" },{ "3", "Strong" },{ "4", "Very Strong" },
-	int crtcurvature = (ZL_Application::SettingsHas("interface_crtcurvature") ? atoi(ZL_Application::SettingsGet("interface_crtcurvature").c_str()) : 2); //{ "0", "Disabled" },{ "1", "Weak" },{ "2", "Default" },{ "3", "Strong" },{ "4", "Very Strong" },
-	int crtcorner    = (ZL_Application::SettingsHas("interface_crtcorner"   ) ? atoi(ZL_Application::SettingsGet("interface_crtcorner"   ).c_str()) : 2); //{ "0", "Disabled" },{ "1", "Weak" },{ "2", "Default" },{ "3", "Strong" },{ "4", "Very Strong" },
+	const int crtscanline  = atoi(GetSetting("interface_crtscanline" , "2")); //{ "0", "No scanline gaps" },{ "4", "Weak gaps" },{ "8", "Strong gaps" },
+	const int crtblur      = atoi(GetSetting("interface_crtblur"     , "2")); //{ "0", "Blurry" },{ "1", "Smooth" },{ "2", "Default" },{ "3", "Pixely" },{ "4", "Sharper" },
+	const int crtmask      = atoi(GetSetting("interface_crtmask"     , "2")); //{ "0", "Disabled" },{ "1", "Weak" },{ "2", "Default" },{ "3", "Strong" },{ "4", "Very Strong" },
+	const int crtcurvature = atoi(GetSetting("interface_crtcurvature", "2")); //{ "0", "Disabled" },{ "1", "Weak" },{ "2", "Default" },{ "3", "Strong" },{ "4", "Very Strong" },
+	const int crtcorner    = atoi(GetSetting("interface_crtcorner"   , "2")); //{ "0", "Disabled" },{ "1", "Weak" },{ "2", "Default" },{ "3", "Strong" },{ "4", "Very Strong" },
+
+	float newFastRate = ZL_Math::Max((float)atof(GetSetting("interface_fastrate", "5")), 0.000f);
+	float newSlowRate = ZL_Math::Min((float)atof(GetSetting("interface_slowrate", "0.3")), 0.999f);
+	if (newFastRate <= 0) { newFastRate = 0; } else if (newFastRate < 1.001f) { newFastRate = 1.001f; }
 
 	mtxCoreOptions.Unlock();
 
-	float ScanlineThinness = 0.5f + (crtscanline * 0.05f);
-	float HorizontalBlur = (crtblur == 0 ? -1.f : crtblur == 1 ? -2.f : crtblur == 2 ? -2.5f : (float)-crtblur);
-	float MaskValue = 1.0f - (0.25f * crtmask);
-	float Curvature = 0.01f * crtcurvature;
-	float Corner = 2.2f * crtcorner;
+	const float ScanlineThinness = 0.5f + (crtscanline * 0.05f);
+	const float HorizontalBlur = (crtblur == 0 ? -1.f : crtblur == 1 ? -2.f : crtblur == 2 ? -2.5f : (float)-crtblur);
+	const float MaskValue = 1.0f - (0.25f * crtmask);
+	const float Curvature = 0.01f * crtcurvature;
+	const float Corner = 2.2f * crtcorner;
 
 	if (useCoreShader)
 		shdrCore.SetUniform(s(srfCore.GetWidth()), s(srfCore.GetHeight()), s(srfCore.GetWidth()*srfCore.GetScaleW()), s(srfCore.GetHeight()*srfCore.GetScaleH()), s(CRTFilter), s(ScanlineThinness), s(HorizontalBlur), s(MaskValue), s(Curvature), s(Corner));
 
-	float newFastRate = (ZL_Application::SettingsHas("interface_fastrate") ? ZL_Math::Max((float)atof(ZL_Application::SettingsGet("interface_fastrate").c_str()), 0.000f) : 5.0f);
-	float newSlowRate = (ZL_Application::SettingsHas("interface_slowrate") ? ZL_Math::Min((float)atof(ZL_Application::SettingsGet("interface_slowrate").c_str()), 0.999f) : 0.3f);
-	if (newFastRate <= 0) { newFastRate = 0; } else if (newFastRate < 1.001f) { newFastRate = 1.001f; }
 	if (newFastRate != FastRate || newSlowRate != SlowRate)
 	{
 		FastRate = newFastRate;
@@ -1819,13 +1886,14 @@ static struct sDOSBoxPure : public ZL_Application
 		ZL_Joystick::Init();
 		RefreshJoysticks();
 
-		OnLoad(argc, argv);
-
 		if (ZL_Application::SettingsHas("interface_contentpath"))
 			DBPS_BrowsePath.assign(ZL_Application::SettingsGet("interface_contentpath"));
 
-		DefaultPointerLock = PointerLock = ((ZL_Application::SettingsGet("interface_lockmouse").c_str()[0]|0x20) == 't');
-		AudioLatency = (ZL_Application::SettingsHas("interface_audiolatency") ? ZL_Math::Max(atoi(ZL_Application::SettingsGet("interface_audiolatency").c_str()), 5) : 25);
+		DefaultPointerLock = PointerLock = ((GetSetting("interface_lockmouse", "false")[0]|0x20) == 't');
+		AudioLatency = ZL_Math::Max(atoi(GetSetting("interface_audiolatency", "25")), 5);
+
+		OnLoad(argc, argv);
+
 		ZL_Audio::Init(AudioLatency * 44100 / 1000);
 		ZL_Audio::HookAudioMix(AudioMix);
 	}
