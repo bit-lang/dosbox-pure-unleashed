@@ -1151,13 +1151,15 @@ void DBPS_OnContentLoad(const char* name, const char* dir, size_t dirlen)
 	ZL_SdlSetTitle(ZL_String("DOSBox Pure - ").append(name).c_str());
 	if (dirlen)
 	{
-		ZL_String contentPath(dir, dirlen);
+		ZL_String contentPath(dir, dirlen + (size_t)(dirlen == 2 && dir[1] == ':' && dir[2] == '\\'));
 		Cross::NormalizePath(Cross::MakePathAbsolute(contentPath));
 		if (ZL_Application::SettingsGet("interface_contentpath") != contentPath)
 		{
 			ZL_Application::SettingsSet("interface_contentpath", contentPath);
 			DirtySettings();
 		}
+		if (DBPS_BrowsePath != contentPath) // to set the browse path when loading via command line
+			DBPS_BrowsePath = contentPath;
 	}
 	SynchronizeSettings(true);
 	AudioSkip = true;
