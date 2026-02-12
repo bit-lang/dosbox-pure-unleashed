@@ -130,7 +130,7 @@ jobs:
         mv Release-linux Release-linux-glcore
     - name: Build for release
       if: ${{ github.event.inputs.versionstring != '' }}
-      uses: addnab/docker-run-action@v3
+      uses: travelpassgroup/docker-run-action@v3
       with:
         image: ubuntu:14.04 # use older distro for increased GLIBC compatibility
         options: -v ${{ github.workspace }}:/work
