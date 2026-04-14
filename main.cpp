@@ -1086,12 +1086,19 @@ static int16_t RETRO_CALLCONV retro_input_state_cb(unsigned port, unsigned devic
 	}
 
 	EBindId bid = GetBindIdFromRetro(device, index, id);
-	if (bid == _BIND_ID_COUNT) return 0;
+	bool analog_button = false;
+	if (bid == _BIND_ID_COUNT)
+	{
+		if (device == RETRO_DEVICE_ANALOG && index == RETRO_DEVICE_INDEX_ANALOG_BUTTON && id < 16)
+			{ bid = GetBindIdFromRetro(RETRO_DEVICE_JOYPAD, 0, id); analog_button = true; }
+		else
+			return 0;
+	}
 
 	if (bid < _BIND_ID_FIRST_AXIS)
 	{
 		SJoyBind& bnd = JoyBinds[port][bid];
-		return (bnd.Joy ? (int)bnd.GetVal(true) : 0);
+		return (bnd.Joy ? (int)bnd.GetVal(analog_button) : 0);
 	}
 	else
 	{
