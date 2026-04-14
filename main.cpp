@@ -1784,6 +1784,7 @@ static void OnLoad(int argc, char *argv[])
 
 	retro_game_info game = {0};
 	if (argc > 1) game.path = argv[1];
+	else if (ZL_Application::SettingsHas("default_content")) game.path = GetSetting("default_content");
 	retro_load_game(&game); //#4
 	for (int i = 2; i < argc; i++)
 		DBPS_AddDisc(argv[i]);
@@ -1861,6 +1862,7 @@ static struct sDOSBoxPure : public ZL_Application
 			}
 		}
 
+		ZL_Application::SettingsInit(basePath.c_str());
 		ZL_String customPathSaves = ZL_Application::SettingsGet("path_saves"), customPathSystem = ZL_Application::SettingsGet("path_system");
 		for (bool useCustomPathSaves = !customPathSaves.empty(), useCustomPathSystem = !customPathSystem.empty();;)
 		{
@@ -1876,7 +1878,6 @@ static struct sDOSBoxPure : public ZL_Application
 			useCustomPathSystem &= !invalidPathSystem;
 		}
 
-		ZL_Application::SettingsInit(basePath.c_str());
 		bool screen_fullscreen = (((*ZL_Application::SettingsGet("screen_fullscreen").c_str())|0x20) == 't'); // 't'rue
 		bool screen_maximized = (((*ZL_Application::SettingsGet("screen_maximized").c_str())|0x20) == 't'); // 't'rue
 		int screen_width = atoi(ZL_Application::SettingsGet("screen_width").c_str());
